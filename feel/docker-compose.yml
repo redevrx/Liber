@@ -1,0 +1,20 @@
+version: "3.9"
+services:
+  redis:
+    container_name: redis
+    image: redis:6.2-alpine
+    restart: always
+    ports:
+      - "6379:6379"
+    command: ['redis-server', '--include', '/usr/local/etc/redis/redis.conf']
+    volumes:
+      - ./db/redis:/var/lib/redis
+      - ./db/redis/redis.conf:/usr/local/etc/redis/redis.conf
+    environment:
+      REDIS_REPLICATION_MODE: master
+      REDIS_USER: redevrx
+      REDIS_HOST: redevrx
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: redevrx
+    networks:
+      - diablos
