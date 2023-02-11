@@ -12,7 +12,8 @@ import (
 	"github.com/go-redis/redis/v8"
 	"github.com/gofiber/fiber/v2"
 	"log"
-	"sync"
+    "strconv"
+    "sync"
 	"time"
 )
 
@@ -72,7 +73,7 @@ func saveRequestRDB(wg *sync.WaitGroup, request friend.BuddyRequest, rdbErrFrom 
 	defer func(rdb *redis.Client) {
 		err := rdb.Close()
 		if err != nil {
-			log.Printf("close redis cache error :%v",err)
+			log.Printf("close redis cache error :%v", err)
 		}
 	}(rdb)
 	defer wg.Done()
@@ -94,7 +95,7 @@ func saveRequestDB(wg *sync.WaitGroup, request friend.BuddyRequest, dbErr chan e
 	defer func(mClient *sql.DB) {
 		err := mClient.Close()
 		if err != nil {
-			log.Printf("close database error :%v",err)
+			log.Printf("close database error :%v", err)
 		}
 	}(mClient)
 	defer wg.Done()
@@ -107,7 +108,7 @@ func saveRequestDB(wg *sync.WaitGroup, request friend.BuddyRequest, dbErr chan e
 // ValidateFriendCache validate friend cache
 func (f FService) ValidateFriendCache(ctx *fiber.Ctx) error {
 	//var request friend.ValidateFriend
-	userId := ctx.Query("id", "")
+	userId := ctx.Query("friendId", "")
 
 	if userId == "" {
 		return ctx.Status(fiber.StatusBadRequest).JSON(
@@ -122,7 +123,7 @@ func (f FService) ValidateFriendCache(ctx *fiber.Ctx) error {
 		defer func(rdb *redis.Client) {
 			err := rdb.Close()
 			if err != nil {
-				log.Printf("close redis cache error :%v",err)
+				log.Printf("close redis cache error :%v", err)
 			}
 		}(rdb)
 
@@ -157,7 +158,7 @@ func (f FService) ValidateFriendCache(ctx *fiber.Ctx) error {
 
 // ValidateFriend validate friend
 func (f FService) ValidateFriend(ctx *fiber.Ctx) error {
-	userId := ctx.Query("id")
+	userId := ctx.Query("friendId", "")
 
 	if userId == "" {
 		return ctx.Status(fiber.StatusBadRequest).JSON(
@@ -176,7 +177,7 @@ func (f FService) ValidateFriend(ctx *fiber.Ctx) error {
 		defer func(mClient *sql.DB) {
 			err := mClient.Close()
 			if err != nil {
-				log.Printf("close database error :%v",err)
+				log.Printf("close database error :%v", err)
 			}
 		}(mClient)
 		defer wg.Done()
@@ -244,4 +245,154 @@ func (f FService) ValidateRequest(ctx *fiber.Ctx) error {
 		return ctx.Status(fiber.StatusBadRequest).JSON(errors)
 	}
 	return ctx.Next()
+}
+
+// AcceptFriend Accept reqeust freind
+func (f FService) AcceptFriend(ctx *fiber.Ctx) error {
+	requestId := ctx.Query("requestId", "")
+
+	if requestId == "" {
+		return ctx.Status(fiber.StatusBadRequest).JSON(res.ToErrorResponse(fiber.StatusBadRequest, "bad request"))
+	}
+
+	type response struct {
+		Data friend.BuddyRequest
+		Err  error
+	}
+
+	mResponse := make(chan response, 1)
+	errD := make(chan error, 1)
+	var wg sync.WaitGroup
+	defer close(mResponse)
+	defer close(errD)
+
+	wg.Add(1)
+	go func(mResponse chan response) {
+		mClinet := db.GetDb()
+		defer mClinet.Close()
+		defer wg.Done()
+
+		var mData response
+
+		errQ := mClinet.QueryRow("SELECT * from RequestFriend where id=?",
+			requestId).Scan(&mData.Data.Id, &mData.Data.UserId, &mData.Data.FromId, &mData.Data.ToId, &mData.Data.Status)
+
+		if errQ != nil {
+			mData.Err = errQ
+			mResponse <- mData
+		}
+
+		//remove request with transections
+		if mData.Data != (friend.BuddyRequest{}) {
+			_, errR := mClinet.Exec("DELETE from RequestFriend where id=?", requestId)
+
+			if errR != nil {
+				mData.Err = errR
+				mResponse <- mData
+				return
+			}
+
+			//save friend status
+			_, errC := mClinet.Exec("Insert Into RequestFriend (id,userId,fromId,toId,createAt,relation) values (?,?,?,?,?,?)",
+				mData.Data.Id, mData.Data.UserId, mData.Data.FromId, mData.Data.ToId, string(time.Now().Unix()), "friend")
+
+            _, errCF := mClinet.Exec("Insert Into RequestFriend (id,userId,fromId,toId,createAt,relation) values (?,?,?,?,?,?)",
+                utils.GetUUId(), mData.Data.UserId, mData.Data.ToId, mData.Data.FromId, string(time.Now().Unix()), "friend")
+
+			if errC != nil && errCF != nil {
+				mData.Err = errC
+				mResponse <- mData
+				return
+			}
+		}
+
+		mResponse <- mData
+	}(mResponse)
+
+	for data := range mResponse {
+		if data.Err != nil {
+			return ctx.Status(fiber.StatusInternalServerError).JSON(res.ToErrorResponse(fiber.StatusInternalServerError, data.Err.Error()))
+		} else {
+			///remove data from redis cache
+			wg.Add(1)
+			go func() {
+				rdb := db.GetRedis()
+				defer func(rdb *redis.Client) {
+					err := rdb.Close()
+					if err != nil {
+						log.Printf("close database error :%v", err)
+					}
+				}(rdb)
+				defer wg.Done()
+
+				ctx := context.Background()
+				_, err := rdb.Del(ctx, data.Data.Id).Result()
+				errD <- err
+			}()
+
+			for mErr := range errD {
+				if mErr != nil {
+					return ctx.Status(fiber.StatusInternalServerError).JSON(res.ToErrorResponse(fiber.StatusInternalServerError, mErr.Error()))
+				} else {
+					return ctx.Status(fiber.StatusOK).JSON(res.WrapResponse{
+						StatusCode:     fiber.StatusOK,
+						IsError:        false,
+						ErrorMessage:   "",
+						SuccessMessage: map[string]string{"requestId": data.Data.Id, "status": "complete"},
+					})
+				}
+			}
+		}
+	}
+
+	wg.Wait()
+
+	return nil
+}
+
+func (f FService) BlockFriend() {
+
+}
+
+func (f FService) FindFriendById() {
+	go func() {
+		mClinet := db.GetDb()
+		defer func(mClinet *sql.DB) {
+			err := mClinet.Close()
+			if err != nil {
+				log.Printf("close database error :%v", err)
+			}
+		}(mClinet)
+
+        mClinet.QueryRow("SELECT * FROM RequestFriend where fromId=? and toId=?","","")
+	}()
+}
+
+func (f FService) FriendList(ctx *fiber.Ctx) error {
+	//create pagination for fetch data
+    id := ctx.Query("userIdkjopijk","")
+    current := ctx.Query("current","0")
+    next := ctx.Query("next","20")
+
+    //validate pagination
+    if current != "" {
+        current = "0"
+        next = "20"
+    }
+    go func() {
+        mClinet := db.GetDb()
+        defer func(mClinet *sql.DB) {
+            err := mClinet.Close()
+            if err != nil {
+                log.Printf("close database error :%v", err)
+            }
+        }(mClinet)
+
+        c, _ := strconv.ParseInt(current,10,32)
+        n, _ := strconv.ParseInt(next,10,32)
+        mClinet.QueryRow("SELECT * FROM RequestFriend where toId=? limit=? offset=?",id,n,c)
+    }()
+
+
+    return nil
 }

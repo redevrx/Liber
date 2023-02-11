@@ -27,6 +27,8 @@ func Router(app *fiber.App) {
 	v1.Post("logout", authController.LogOut)
 	v1.Post("friend/request", friendController.ValidateRequest, friendController.RequestFriend)
 	v1.Get("friend/validate/:friendId", friendController.VFriendCache, friendController.VFriend)
+	v1.Post("friend/accept")
+	v1.Get
 	v1.Get("test", func(ctx *fiber.Ctx) error {
 		return ctx.JSON("Suc")
 	})
